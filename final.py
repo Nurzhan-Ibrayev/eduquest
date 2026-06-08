@@ -73,6 +73,25 @@ p, span, div, label, h1, h2, h3, h4, h5, h6,
 }
 [data-baseweb="select"] span { color: var(--text) !important; }
 
+/* Dropdown popup */
+ul[role="listbox"] {
+    background: var(--surface2) !important;
+    border: 1px solid var(--border) !important;
+}
+ul[role="listbox"] li {
+    background: var(--surface2) !important;
+    color: var(--text) !important;
+}
+ul[role="listbox"] li:hover,
+ul[role="listbox"] li[aria-selected="true"] {
+    background: var(--surface) !important;
+    color: var(--text) !important;
+}
+[role="option"] {
+    background: var(--surface2) !important;
+    color: var(--text) !important;
+}
+
 /* Buttons */
 .stButton button {
     background: var(--accent) !important;
@@ -137,7 +156,15 @@ details summary { color: var(--text) !important; }
 .stSlider [data-testid="stTickBar"] { color: var(--muted) !important; }
 
 /* Code blocks */
-.stCode { background: var(--surface) !important; }
+.stCode, .stCode pre, [data-testid="stCode"],
+[data-testid="stCode"] pre, [data-testid="stCode"] code {
+    background: #0d1117 !important;
+    color: #e6edf3 !important;
+}
+/* Expander */
+details summary p { color: var(--text) !important; }
+[data-testid="stExpander"] { background: var(--surface2) !important; border-color: var(--border) !important; }
+[data-testid="stExpander"] p { color: var(--text) !important; }
 
 .card {
     background: var(--surface2);
@@ -414,12 +441,22 @@ def rank_medal(rank: int) -> str:
 # ─── EXCEL EXPORT ─────────────────────────────────────────────────────────────
 def build_excel(session_id: int, session_title: str) -> bytes:
     rows = db.get_session_export(session_id)
+    summary = db.get_session_summary_export(session_id)
     lb = db.get_session_leaderboard(session_id)
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df_answers = pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame()
-        df_answers.to_excel(writer, sheet_name="Ответы", index=False)
+        # Sheet 1: detailed answers
+        df = pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame(
+            columns=["Ученик", "Класс", "№", "Вопрос", "Ответ", "Оценка", "XP", "Обратная связь", "Время"]
+        )
+        df.to_excel(writer, sheet_name="Ответы", index=False)
+
+        # Sheet 2: summary per student
+        if summary:
+            pd.DataFrame([dict(r) for r in summary]).to_excel(writer, sheet_name="Сводка", index=False)
+
+        # Sheet 3: leaderboard
         if lb:
             pd.DataFrame([dict(r) for r in lb]).to_excel(writer, sheet_name="Рейтинг", index=False)
     return buf.getvalue()
@@ -535,9 +572,11 @@ def teacher_view():
     # ── СОЗДАТЬ ──────────────────────────────────────────────────────────────
     with tab1:
         st.markdown("#### Новая сессия")
-        col1, col2 = st.columns([3, 2])
+
+        col1, col2 = st.columns(2)
         with col1:
             title = st.text_input("Название сессии", placeholder="Глава 5 — Повторение")
+        with col2:
             gcol, lcol = st.columns(2)
             with gcol:
                 grade = st.selectbox("Класс", options=sorted(GRADE_BOOKS.keys()),
@@ -545,26 +584,55 @@ def teacher_view():
             with lcol:
                 lang = st.selectbox("Язык", options=["ru", "kz"],
                                     format_func=lambda l: "Русский" if l == "ru" else "Қазақша")
-            question = st.text_area("Вопрос для учеников", height=120,
-                                    placeholder="Что такое оперативная память и как она работает?")
-            time_limit = st.slider("Лимит времени (мин)", 2, 60, 10)
 
-        with col2:
-            st.markdown("<br>", unsafe_allow_html=True)
+        time_limit = st.slider("Лимит времени (мин)", 2, 60, 15)
+
+        st.markdown("#### Вопросы")
+
+        # Dynamic question list in session state
+        if "draft_questions" not in st.session_state:
+            st.session_state.draft_questions = [""]
+
+        for i in range(len(st.session_state.draft_questions)):
+            c1, c2 = st.columns([10, 1])
+            with c1:
+                st.session_state.draft_questions[i] = st.text_area(
+                    f"Вопрос {i + 1}",
+                    value=st.session_state.draft_questions[i],
+                    key=f"dq_{i}",
+                    height=80,
+                    placeholder="Что такое оперативная память?"
+                )
+            with c2:
+                st.markdown("<br><br>", unsafe_allow_html=True)
+                if len(st.session_state.draft_questions) > 1:
+                    if st.button("✕", key=f"rm_{i}"):
+                        st.session_state.draft_questions.pop(i)
+                        st.rerun()
+
+        add_col, cnt_col = st.columns([2, 1])
+        with add_col:
+            if len(st.session_state.draft_questions) < 15:
+                if st.button("＋ Добавить вопрос"):
+                    st.session_state.draft_questions.append("")
+                    st.rerun()
+        with cnt_col:
+            st.caption(f"{len(st.session_state.draft_questions)} / 15 вопросов")
 
         if st.button("🚀 Создать сессию", use_container_width=True):
-            if not question.strip():
-                st.error("Введите вопрос")
+            valid = [q.strip() for q in st.session_state.draft_questions if q.strip()]
+            if not valid:
+                st.error("Добавьте хотя бы один вопрос")
             else:
                 row = db.create_session(
                     title=title or "Квиз",
-                    question=question.strip(),
+                    question_texts=valid,
                     grade=grade,
                     lang=lang,
                     time_limit=time_limit,
-                    chat_enabled=False,
                     teacher_id=st.session_state.user_id
                 )
+                st.session_state.draft_questions = [""]
                 st.success("Сессия создана!")
                 st.markdown(f"""
                 <div style='background:#1a2235; border:2px solid #6366f1; border-radius:12px;
@@ -575,7 +643,7 @@ def teacher_view():
                     <div style='font-family: Space Mono, monospace; font-size:3rem; font-weight:700;
                          color:#22d3ee; letter-spacing:0.3em;'>{row["code"]}</div>
                     <div style='color:#64748b; font-size:0.8rem; margin-top:0.5rem;'>
-                        {grade} класс · {time_limit} мин · {title or "Квиз"}
+                        {grade} класс · {time_limit} мин · {len(valid)} вопр. · {title or "Квиз"}
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
@@ -751,42 +819,39 @@ def student_view():
 
     # ── TAB 1: ANSWER ─────────────────────────────────────────────────────────
     with tab1:
-        st.markdown(f"""
-        <div style='background:#1a2235; border-left:3px solid #6366f1; border-radius:12px;
-             padding:1.25rem; margin-bottom:1.5rem;'>
-            <div style='color:#64748b; font-size:0.8rem; text-transform:uppercase;
-                 letter-spacing:0.1em; margin-bottom:0.5rem;'>📌 Вопрос</div>
-            <div style='font-size:1.1rem; font-weight:500; color:#f1f5f9;'>{sess['question']}</div>
-        </div>
-        """, unsafe_allow_html=True)
+        questions = db.get_session_questions(sess["id"])
+        n_total = len(questions)
 
-        existing = db.get_student_answer(st.session_state.user_id, sess["id"])
+        # Build answered map
+        answered_map = {q["id"]: db.get_student_answer_for_question(st.session_state.user_id, q["id"])
+                        for q in questions}
+        n_answered = sum(1 for a in answered_map.values() if a)
 
-        if existing:
-            st.success("✅ Вы уже ответили на этот вопрос.")
-            score_color = "#10b981" if existing["score"] >= 70 else "#f59e0b" if existing["score"] >= 40 else "#ef4444"
+        # Progress bar
+        if n_total > 1:
+            st.progress(n_answered / n_total if n_total else 0)
+            st.caption(f"Отвечено: {n_answered} / {n_total} вопросов")
+            st.markdown("")
+
+        # Find next unanswered question
+        next_q = next((q for q in questions if not answered_map[q["id"]]), None)
+
+        if next_q and sess["status"] == "active":
+            # Show current question
+            label = f"Вопрос {next_q['order_num']} из {n_total}" if n_total > 1 else "Вопрос"
             st.markdown(f"""
-            <div style='display:flex; gap:1rem; margin:1rem 0;'>
-                <div class='card' style='flex:1; text-align:center;'>
-                    <div style='font-size:2.5rem; font-weight:700; color:{score_color};
-                         font-family:Space Mono,monospace;'>{existing['score']}</div>
-                    <div style='color:#64748b; font-size:0.85rem;'>/ 100 Score</div>
-                </div>
-                <div class='card' style='flex:1; text-align:center;'>
-                    <div style='font-size:2.5rem; font-weight:700; color:#f59e0b;
-                         font-family:Space Mono,monospace;'>+{existing['xp_earned']}</div>
-                    <div style='color:#64748b; font-size:0.85rem;'>XP Earned</div>
-                </div>
+            <div style='background:#1a2235; border-left:3px solid #6366f1; border-radius:12px;
+                 padding:1.25rem; margin-bottom:1.5rem;'>
+                <div style='color:#64748b; font-size:0.8rem; text-transform:uppercase;
+                     letter-spacing:0.1em; margin-bottom:0.5rem;'>📌 {label}</div>
+                <div style='font-size:1.1rem; font-weight:500; color:#f1f5f9;'>{next_q['question_text']}</div>
             </div>
             """, unsafe_allow_html=True)
-            with st.expander("📋 Подробная обратная связь"):
-                st.code(existing["feedback"], language=None)
 
-        elif sess["status"] == "active":
             student_answer = st.text_area(
                 "Ваш ответ", height=150,
                 placeholder="Напишите ответ здесь...",
-                key="student_answer_input"
+                key=f"ans_{next_q['id']}"
             )
             if st.button("✅ Отправить ответ", use_container_width=True):
                 if not student_answer.strip():
@@ -794,40 +859,89 @@ def student_view():
                 else:
                     with st.spinner("ИИ оценивает ваш ответ..."):
                         result = evaluate_answer(
-                            sess["question"], student_answer, collection, client,
+                            next_q["question_text"], student_answer, collection, client,
                             grade=sess.get("grade"), lang=sess.get("lang", "ru")
                         )
-
                     score = result["score"]
-                    xp_earned = score_to_xp(score)
                     db.submit_answer(
                         student_id=st.session_state.user_id,
                         session_id=sess["id"],
+                        question_id=next_q["id"],
                         answer_text=student_answer,
                         score=score,
-                        xp_earned=xp_earned,
                         feedback=result["feedback"]
                     )
 
+                    # Check if this was the last question → award XP
+                    updated_map = {q["id"]: db.get_student_answer_for_question(
+                        st.session_state.user_id, q["id"]) for q in questions}
+                    all_answered = all(updated_map[q["id"]] for q in questions)
+                    if all_answered:
+                        avg_score = sum(a["score"] for a in updated_map.values()) // n_total
+                        xp_earned = score_to_xp(avg_score)
+                        db.finalize_session_xp(st.session_state.user_id, sess["id"], xp_earned)
+                    else:
+                        xp_earned = 0
+
                     score_color = "#10b981" if score >= 70 else "#f59e0b" if score >= 40 else "#ef4444"
-                    st.markdown(f"""
+                    msg = f"""
                     <div style='display:flex; gap:1rem; margin:1rem 0;'>
-                        <div class='card' style='flex:1; text-align:center;'>
+                        <div style='flex:1; text-align:center; background:#1a2235;
+                             border-radius:12px; padding:1rem;'>
                             <div style='font-size:2.5rem; font-weight:700; color:{score_color};
                                  font-family:Space Mono,monospace;'>{score}</div>
-                            <div style='color:#64748b; font-size:0.85rem;'>/ 100 Score</div>
-                        </div>
-                        <div class='card' style='flex:1; text-align:center;'>
+                            <div style='color:#64748b; font-size:0.85rem;'>/ 100</div>
+                        </div>"""
+                    if all_answered:
+                        msg += f"""
+                        <div style='flex:1; text-align:center; background:#1a2235;
+                             border-radius:12px; padding:1rem;'>
                             <div style='font-size:2.5rem; font-weight:700; color:#f59e0b;
                                  font-family:Space Mono,monospace;'>+{xp_earned}</div>
-                            <div style='color:#64748b; font-size:0.85rem;'>XP Earned</div>
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    with st.expander("📋 Подробная обратная связь", expanded=True):
-                        st.code(result["feedback"], language=None)
+                            <div style='color:#64748b; font-size:0.85rem;'>XP начислено!</div>
+                        </div>"""
+                    msg += "</div>"
+                    st.markdown(msg, unsafe_allow_html=True)
+                    if all_answered:
+                        st.info("Все вопросы отвечены! Смотрите итоги ниже.")
+                    else:
+                        remaining = n_total - n_answered - 1
+                        st.info(f"Осталось вопросов: {remaining}")
                     st.rerun()
-        else:
+
+        elif n_answered == n_total and n_total > 0:
+            # All questions done — show summary
+            all_answers = [answered_map[q["id"]] for q in questions]
+            total_xp = sum(a["xp_earned"] for a in all_answers)  # stored on last answer
+            avg_score = sum(a["score"] for a in all_answers) // n_total
+
+            score_color = "#10b981" if avg_score >= 70 else "#f59e0b" if avg_score >= 40 else "#ef4444"
+            st.success(f"✅ Все {n_total} вопросов отвечены!")
+            st.markdown(f"""
+            <div style='display:flex; gap:1rem; margin:1rem 0;'>
+                <div style='flex:1; text-align:center; background:#1a2235; border-radius:12px; padding:1rem;'>
+                    <div style='font-size:2.5rem; font-weight:700; color:{score_color};
+                         font-family:Space Mono,monospace;'>{avg_score}</div>
+                    <div style='color:#64748b; font-size:0.85rem;'>Средняя оценка</div>
+                </div>
+                <div style='flex:1; text-align:center; background:#1a2235; border-radius:12px; padding:1rem;'>
+                    <div style='font-size:2.5rem; font-weight:700; color:#f59e0b;
+                         font-family:Space Mono,monospace;'>+{total_xp}</div>
+                    <div style='color:#64748b; font-size:0.85rem;'>Всего XP</div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            st.markdown("##### Разбор ответов")
+            for q, ans in zip(questions, all_answers):
+                sc = ans["score"]
+                sc_color = "#10b981" if sc >= 70 else "#f59e0b" if sc >= 40 else "#ef4444"
+                with st.expander(f"Вопрос {q['order_num']}: {q['question_text'][:70]}... — {sc}/100", expanded=True):
+                    st.markdown(f"**Ваш ответ:** {ans['answer_text']}")
+                    st.markdown("**Оценка ИИ:**")
+                    st.code(ans["feedback"], language=None)
+
+        elif sess["status"] != "active":
             st.info("Сессия закрыта. Отправка ответов недоступна.")
 
     # ── TAB 2: SESSION LEADERBOARD ────────────────────────────────────────────

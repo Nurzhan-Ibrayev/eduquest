@@ -48,7 +48,7 @@ def init_db():
                     id SERIAL PRIMARY KEY,
                     code CHAR(6) UNIQUE NOT NULL,
                     title VARCHAR(200) NOT NULL,
-                    question TEXT NOT NULL,
+                    question TEXT,
                     grade INTEGER NOT NULL,
                     lang VARCHAR(2) DEFAULT 'ru',
                     time_limit INTEGER DEFAULT 10,
@@ -58,10 +58,18 @@ def init_db():
                     created_at TIMESTAMP DEFAULT NOW()
                 );
 
+                CREATE TABLE IF NOT EXISTS questions (
+                    id SERIAL PRIMARY KEY,
+                    session_id INTEGER REFERENCES sessions(id) ON DELETE CASCADE,
+                    question_text TEXT NOT NULL,
+                    order_num INTEGER NOT NULL DEFAULT 1
+                );
+
                 CREATE TABLE IF NOT EXISTS answers (
                     id SERIAL PRIMARY KEY,
                     student_id INTEGER REFERENCES students(id),
                     session_id INTEGER REFERENCES sessions(id),
+                    question_id INTEGER REFERENCES questions(id),
                     answer_text TEXT NOT NULL,
                     score INTEGER NOT NULL,
                     xp_earned INTEGER NOT NULL,
@@ -69,6 +77,22 @@ def init_db():
                     created_at TIMESTAMP DEFAULT NOW()
                 );
             """)
+
+            # Add question_id column to answers if missing
+            cur.execute("""
+                ALTER TABLE answers
+                ADD COLUMN IF NOT EXISTS question_id INTEGER REFERENCES questions(id);
+            """)
+
+            # Migrate old single-question sessions to questions table
+            cur.execute("""
+                INSERT INTO questions (session_id, question_text, order_num)
+                SELECT s.id, s.question, 1
+                FROM sessions s
+                WHERE s.question IS NOT NULL AND s.question != ''
+                  AND NOT EXISTS (SELECT 1 FROM questions q WHERE q.session_id = s.id)
+            """)
+
         c.commit()
         _seed(c)
     finally:
@@ -155,18 +179,40 @@ def _expire():
         c.close()
 
 
-def create_session(title, question, grade, lang, time_limit, chat_enabled, teacher_id):
+def create_session(title, question_texts: list, grade, lang, time_limit, teacher_id):
+    """Create session with a list of questions."""
     code = hashlib.md5(str(time.time()).encode()).hexdigest()[:6].upper()
+    first_q = question_texts[0] if question_texts else ""
     c = _conn()
     try:
         with c.cursor() as cur:
             cur.execute("""
                 INSERT INTO sessions (code, title, question, grade, lang, time_limit, chat_enabled, teacher_id)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id, code
-            """, (code, title, question, grade, lang, time_limit, chat_enabled, teacher_id))
+                VALUES (%s, %s, %s, %s, %s, %s, FALSE, %s) RETURNING id, code
+            """, (code, title, first_q, grade, lang, time_limit, teacher_id))
             row = cur.fetchone()
+            session_id = row["id"]
+
+            for i, text in enumerate(question_texts, 1):
+                cur.execute(
+                    "INSERT INTO questions (session_id, question_text, order_num) VALUES (%s, %s, %s)",
+                    (session_id, text.strip(), i)
+                )
         c.commit()
         return row
+    finally:
+        c.close()
+
+
+def get_session_questions(session_id: int):
+    c = _conn()
+    try:
+        with c.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM questions WHERE session_id=%s ORDER BY order_num",
+                (session_id,)
+            )
+            return cur.fetchall()
     finally:
         c.close()
 
@@ -180,7 +226,8 @@ def get_sessions_for_grade(grade: int):
                 SELECT s.*, t.name as teacher_name,
                        GREATEST(0, EXTRACT(EPOCH FROM
                            (s.created_at + (s.time_limit || ' minutes')::interval - NOW())
-                       ) / 60)::int AS mins_left
+                       ) / 60)::int AS mins_left,
+                       (SELECT COUNT(*) FROM questions q WHERE q.session_id = s.id) AS question_count
                 FROM sessions s
                 JOIN teachers t ON t.id = s.teacher_id
                 WHERE s.grade = %s AND s.status = 'active'
@@ -196,7 +243,10 @@ def get_session(session_id: int):
     c = _conn()
     try:
         with c.cursor() as cur:
-            cur.execute("SELECT * FROM sessions WHERE id=%s", (session_id,))
+            cur.execute(
+                "SELECT s.*, (SELECT COUNT(*) FROM questions q WHERE q.session_id = s.id) AS question_count FROM sessions s WHERE s.id=%s",
+                (session_id,)
+            )
             return cur.fetchone()
     finally:
         c.close()
@@ -209,7 +259,8 @@ def get_all_sessions():
         with c.cursor() as cur:
             cur.execute("""
                 SELECT s.*, t.name as teacher_name,
-                       COUNT(DISTINCT a.student_id) as student_count
+                       COUNT(DISTINCT a.student_id) as student_count,
+                       (SELECT COUNT(*) FROM questions q WHERE q.session_id = s.id) AS question_count
                 FROM sessions s
                 JOIN teachers t ON t.id = s.teacher_id
                 LEFT JOIN answers a ON a.session_id = s.id
@@ -231,10 +282,7 @@ def set_session_status(session_id: int, status: str):
                     (status, session_id)
                 )
             else:
-                cur.execute(
-                    "UPDATE sessions SET status=%s WHERE id=%s",
-                    (status, session_id)
-                )
+                cur.execute("UPDATE sessions SET status=%s WHERE id=%s", (status, session_id))
         c.commit()
     finally:
         c.close()
@@ -242,37 +290,71 @@ def set_session_status(session_id: int, status: str):
 
 # ─── ANSWERS ──────────────────────────────────────────────────────────────────
 
-def get_student_answer(student_id: int, session_id: int):
+def get_student_answer_for_question(student_id: int, question_id: int):
     c = _conn()
     try:
         with c.cursor() as cur:
             cur.execute("""
                 SELECT * FROM answers
-                WHERE student_id=%s AND session_id=%s
-                ORDER BY created_at DESC LIMIT 1
-            """, (student_id, session_id))
+                WHERE student_id=%s AND question_id=%s
+                LIMIT 1
+            """, (student_id, question_id))
             return cur.fetchone()
     finally:
         c.close()
 
 
-def submit_answer(student_id: int, session_id: int,
-                  answer_text: str, score: int, xp_earned: int, feedback: str) -> int:
+def get_student_session_answers(student_id: int, session_id: int):
+    """All answers by a student in a session."""
     c = _conn()
     try:
         with c.cursor() as cur:
             cur.execute("""
-                INSERT INTO answers (student_id, session_id, answer_text, score, xp_earned, feedback)
-                VALUES (%s, %s, %s, %s, %s, %s)
-            """, (student_id, session_id, answer_text, score, xp_earned, feedback))
+                SELECT a.*, q.question_text, q.order_num
+                FROM answers a
+                JOIN questions q ON q.id = a.question_id
+                WHERE a.student_id=%s AND a.session_id=%s
+                ORDER BY q.order_num
+            """, (student_id, session_id))
+            return cur.fetchall()
+    finally:
+        c.close()
 
+
+def submit_answer(student_id: int, session_id: int, question_id: int,
+                  answer_text: str, score: int, feedback: str):
+    """Store answer. XP is awarded separately via finalize_session_xp."""
+    c = _conn()
+    try:
+        with c.cursor() as cur:
+            cur.execute("""
+                INSERT INTO answers (student_id, session_id, question_id, answer_text, score, xp_earned, feedback)
+                VALUES (%s, %s, %s, %s, %s, 0, %s)
+            """, (student_id, session_id, question_id, answer_text, score, feedback))
+        c.commit()
+    finally:
+        c.close()
+
+
+def finalize_session_xp(student_id: int, session_id: int, xp: int) -> int:
+    """Award XP once at end of session based on avg score. Updates last answer row."""
+    c = _conn()
+    try:
+        with c.cursor() as cur:
+            cur.execute("""
+                UPDATE answers SET xp_earned = %s
+                WHERE id = (
+                    SELECT id FROM answers
+                    WHERE student_id=%s AND session_id=%s
+                    ORDER BY created_at DESC LIMIT 1
+                )
+            """, (xp, student_id, session_id))
             cur.execute(
                 "UPDATE students SET total_xp = total_xp + %s WHERE id=%s RETURNING total_xp",
-                (xp_earned, student_id)
+                (xp, student_id)
             )
             new_xp = cur.fetchone()["total_xp"]
-            new_level = _calc_level(new_xp)
-            cur.execute("UPDATE students SET level=%s WHERE id=%s", (new_level, student_id))
+            cur.execute("UPDATE students SET level=%s WHERE id=%s", (_calc_level(new_xp), student_id))
         c.commit()
         return new_xp
     finally:
@@ -296,7 +378,8 @@ def get_session_leaderboard(session_id: int):
             cur.execute("""
                 SELECT s.name, s.grade,
                        SUM(a.xp_earned) as session_xp,
-                       MAX(a.score) as best_score
+                       ROUND(AVG(a.score)) as avg_score,
+                       COUNT(a.id) as answered
                 FROM answers a
                 JOIN students s ON s.id = a.student_id
                 WHERE a.session_id = %s
@@ -325,21 +408,47 @@ def get_class_leaderboard(grade: int):
 # ─── EXPORT ───────────────────────────────────────────────────────────────────
 
 def get_session_export(session_id: int):
+    """Returns detailed rows: one per student per question."""
     c = _conn()
     try:
         with c.cursor() as cur:
             cur.execute("""
                 SELECT s.name      AS "Ученик",
                        s.grade     AS "Класс",
-                       a.score     AS "Оценка",
-                       a.xp_earned AS "XP",
-                       a.answer_text AS "Ответ",
-                       a.feedback  AS "Обратная связь",
-                       a.created_at AS "Время"
+                       q.order_num AS "№",
+                       q.question_text AS "Вопрос",
+                       a.answer_text   AS "Ответ",
+                       a.score         AS "Оценка",
+                       a.xp_earned     AS "XP",
+                       a.feedback      AS "Обратная связь",
+                       a.created_at    AS "Время"
+                FROM answers a
+                JOIN students s ON s.id = a.student_id
+                JOIN questions q ON q.id = a.question_id
+                WHERE a.session_id = %s
+                ORDER BY s.name, q.order_num
+            """, (session_id,))
+            return cur.fetchall()
+    finally:
+        c.close()
+
+
+def get_session_summary_export(session_id: int):
+    """Summary: one row per student with totals."""
+    c = _conn()
+    try:
+        with c.cursor() as cur:
+            cur.execute("""
+                SELECT s.name            AS "Ученик",
+                       s.grade           AS "Класс",
+                       COUNT(a.id)       AS "Отвечено вопросов",
+                       ROUND(AVG(a.score)) AS "Средняя оценка",
+                       SUM(a.xp_earned)  AS "Итого XP"
                 FROM answers a
                 JOIN students s ON s.id = a.student_id
                 WHERE a.session_id = %s
-                ORDER BY a.score DESC
+                GROUP BY s.id, s.name, s.grade
+                ORDER BY SUM(a.xp_earned) DESC
             """, (session_id,))
             return cur.fetchall()
     finally:
