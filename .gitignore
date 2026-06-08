@@ -18,4 +18,3 @@ EOF
 ingest_pdf_ocr.py
 test_ocr.py
 upload_to_cloud.py
-db.py
