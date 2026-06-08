@@ -12,4 +12,9 @@ main_copy.py
 test.ipynb
 __pycache__/
 .env
+.streamlit/secrets.toml
+ocr_cache/
 EOF
+ingest_pdf_ocr.py
+test_ocr.py
+upload_to_cloud.py

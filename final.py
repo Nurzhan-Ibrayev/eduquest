@@ -145,7 +145,17 @@ div[data-testid="metric-container"] {
 def get_clients():
     api_key = st.secrets.get("OPENAI_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
     client = OpenAI(api_key=api_key)
-    chroma = chromadb.PersistentClient(path="./chroma_db")
+
+    chroma_api_key = st.secrets.get("CHROMA_API_KEY", os.environ.get("CHROMA_API_KEY", ""))
+    if chroma_api_key:
+        chroma = chromadb.CloudClient(
+            tenant=st.secrets.get("CHROMA_TENANT", os.environ.get("CHROMA_TENANT", "")),
+            database=st.secrets.get("CHROMA_DATABASE", os.environ.get("CHROMA_DATABASE", "")),
+            api_key=chroma_api_key
+        )
+    else:
+        chroma = chromadb.PersistentClient(path="./chroma_db")
+
     collection = chroma.get_or_create_collection(
         name="school_booksv2",
         metadata={"hnsw:space": "cosine"}
@@ -154,6 +164,17 @@ def get_clients():
 
 SOURCE_MAP = {
     "almaty_7_class": "Информатика, 7 класс — Алматыкітап баспасы, 2021",
+}
+
+# Grade → book keys mapping (for filtering ChromaDB by class)
+GRADE_BOOKS = {
+    5:  ["arman_pv_5", "arman_pv_5_kaz"],
+    6:  ["6_class_rus", "6_class_kz"],
+    7:  ["almaty_7", "almaty_7_class", "almaty_7_kaz", "arman_pv_7_watermark"],
+    8:  ["inf_8_okulik", "arman_pv_8", "arman_pv_8_kaz"],
+    9:  ["arman_pv_9_watermark", "arman_pv_9_kaz"],
+    10: ["arman_pv_10", "arman_pv_10_kaz"],
+    11: ["arman_pv_11", "arman_pv_11_kaz"],
 }
 
 # ─── SESSION STORAGE (JSON file for persistence across users) ─────────────────
@@ -182,22 +203,26 @@ def embed(text, client):
     v = np.array(r.data[0].embedding)
     return (v / np.linalg.norm(v)).tolist()
 
-def ask(query, collection, client, top_k=5):
+def ask(query, collection, client, top_k=5, grade=None):
     q_emb = embed(query, client)
-    res = collection.query(
+    kwargs = dict(
         query_embeddings=[q_emb],
         n_results=top_k,
         include=["documents", "metadatas", "distances"]
     )
+    if grade and grade in GRADE_BOOKS:
+        kwargs["where"] = {"book": {"$in": GRADE_BOOKS[grade]}}
+    res = collection.query(**kwargs)
     results = []
     for doc, meta, dist in zip(res["documents"][0], res["metadatas"][0], res["distances"][0]):
-        results.append({"text": doc, "book": meta["book"], "page": meta["page"], "dist": float(dist)})
+        label = meta.get("label") or SOURCE_MAP.get(meta["book"], meta["book"])
+        results.append({"text": doc, "book": label, "page": meta["page"], "dist": float(dist)})
     return results
 
-def get_context_text(question, collection, client):
-    contexts = ask(question, collection, client, top_k=5)
+def get_context_text(question, collection, client, grade=None):
+    contexts = ask(question, collection, client, top_k=5, grade=grade)
     texts = [c["text"] for c in contexts]
-    sources = list({f'{c["book"]}, page {c["page"]}' for c in contexts})
+    sources = list({f'{c["book"]}, стр. {c["page"]}' for c in contexts})
     return "\n\n".join(texts), "; ".join(sources)
 
 def keyword_score(context, answer):
@@ -205,11 +230,8 @@ def keyword_score(context, answer):
     aw = set(answer.lower().split())
     return len(cw & aw) / max(len(cw), 1)
 
-def evaluate_answer(question, student_answer, collection, client):
-    context_text, source_text = get_context_text(question, collection, client)
-    kw_score = keyword_score(context_text, student_answer)
-    ctx = context_text[:3000]
-    prompt = f"""Ты система проверки знаний школьников. Отвечай ТОЛЬКО на русском языке.
+EVAL_PROMPT = {
+    "ru": """Ты система проверки знаний школьников. Отвечай ТОЛЬКО на русском языке.
 
 ПРАВИЛА:
 - Используй ТОЛЬКО предоставленный учебный материал
@@ -240,7 +262,51 @@ Score: [число]
 Верно: [пункты]
 Правильный ответ: [полный ответ строго по тексту учебника]
 Обратная связь: [1-2 предложения]
-Источник: [info]"""
+Источник: [info]""",
+    "kz": """Сен мектеп оқушыларының білімін тексеру жүйесісің. ТЕК қазақ тілінде жауап бер.
+
+ЕРЕЖЕЛЕР:
+- ТЕК берілген оқулық материалды пайдалан
+- Өз мысалдарыңды ҚОСПА
+- Қатаң бол, бірақ әділ бол
+
+ТАПСЫРМА:
+1. Оқушының жауабын оқулық материалымен салыстыр
+2. Баға қой (0-100)
+3. ЖЕТІСПЕЙТІНІН көрсет (тек мәтіннен)
+4. ДҰРЫСЫН көрсет (бар болса)
+5. Оқулық бойынша ДҰРЫС ЖАУАП бер
+6. Қысқа кері байланыс бер
+
+БАҒАЛАУ:
+- Өте қысқа немесе жартылай жауап → 20–40
+- Қасиеттері мен егжей-тегжейлері жоқ жауап → ең көбі 50
+- Толық жауап (анықтама + егжей-тегжей) → 80+
+
+Сұрақ: {question}
+Оқушы жауабы: {student_answer}
+Оқулық материалы: {ctx}
+Дереккөздер: {source_text}
+
+Жауап осы форматта:
+Score: [сан]
+Жетіспейді: [тармақтар]
+Дұрыс: [тармақтар]
+Дұрыс жауап: [оқулық бойынша толық жауап]
+Кері байланыс: [1-2 сөйлем]
+Дереккөз: [info]"""
+}
+
+def evaluate_answer(question, student_answer, collection, client, grade=None, lang="ru"):
+    context_text, source_text = get_context_text(question, collection, client, grade=grade)
+    kw_score = keyword_score(context_text, student_answer)
+    ctx = context_text[:3000]
+    prompt = EVAL_PROMPT.get(lang, EVAL_PROMPT["ru"]).format(
+        question=question,
+        student_answer=student_answer,
+        ctx=ctx,
+        source_text=source_text
+    )
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -259,8 +325,8 @@ Score: [число]
 
     return {"feedback": raw, "score": score, "keyword_score": kw_score, "source": source_text}
 
-def answer_with_llm(query, collection, client, top_k=5):
-    contexts = ask(query, collection, client, top_k)
+def answer_with_llm(query, collection, client, top_k=5, grade=None):
+    contexts = ask(query, collection, client, top_k, grade=grade)
     if not contexts:
         return "Answer not found in the knowledge base."
     sources = {}
@@ -409,6 +475,13 @@ def teacher_view():
         col1, col2 = st.columns([3, 2])
         with col1:
             session_title = st.text_input("Session title", placeholder="e.g. Chapter 5 Review")
+            gcol, lcol = st.columns(2)
+            with gcol:
+                grade = st.selectbox("Класс", options=sorted(GRADE_BOOKS.keys()),
+                                     format_func=lambda g: f"{g} класс")
+            with lcol:
+                lang = st.selectbox("Язык сессии", options=["ru", "kz"],
+                                    format_func=lambda l: "Русский" if l == "ru" else "Қазақша")
             question = st.text_area("Question for students", height=120,
                                     placeholder="e.g. What is RAM and how does it work?")
             time_limit = st.slider("Time limit (minutes)", 2, 30, 10)
@@ -427,6 +500,8 @@ def teacher_view():
                 sessions[code] = {
                     "title": session_title or "Quiz Session",
                     "question": question,
+                    "grade": grade,
+                    "lang": lang,
                     "time_limit": time_limit,
                     "chat_enabled": chat_enabled,
                     "created_at": datetime.now().isoformat(),
@@ -619,7 +694,9 @@ def student_view():
                     st.warning("Please write your answer first.")
                 else:
                     with st.spinner("AI is evaluating your answer..."):
-                        result = evaluate_answer(sess["question"], student_answer, collection, client)
+                        result = evaluate_answer(sess["question"], student_answer, collection, client,
+                                                grade=sess.get("grade"),
+                                                lang=sess.get("lang", "ru"))
 
                     score = result["score"]
                     xp_earned = score_to_xp(score)
@@ -734,7 +811,8 @@ def student_view():
                 st.session_state.chat_messages.append({"role": "user", "content": user_input})
                 st.chat_message("user").write(user_input)
                 with st.spinner("Searching textbook..."):
-                    answer = answer_with_llm(user_input, collection, client)
+                    answer = answer_with_llm(user_input, collection, client,
+                                             grade=sessions[code].get("grade"))
                 st.session_state.chat_messages.append({"role": "assistant", "content": answer})
                 st.chat_message("assistant").write(answer)
 
